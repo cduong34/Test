@@ -99,9 +99,9 @@ FG_TEST = {
 # Production environment (fill in prod credentials when ready)
 FG_PROD = {
     "base_url":              "https://www.us.fieldglass.cloud.sap",
-    "app_key":               os.getenv("FG_PROD_APP_KEY",     ""),
-    "iu_user":               os.getenv("FG_PROD_IU_USER",     ""),
-    "iu_password":           os.getenv("FG_PROD_IU_PASSWORD", ""),
+    "app_key":               os.getenv("FG_PROD_APP_KEY",     "dlgEbqGNj4Eg45JA5ll9AMWbhSa"),
+    "iu_user":               os.getenv("FG_PROD_IU_USER",     "Christine"),
+    "iu_password":           os.getenv("FG_PROD_IU_PASSWORD", "INSTA_jBMTeGaKPZarS6fLkBJgnbcDCU2"),
     "connector":             "Job Seeker Upload",
     "supplier_code":         "INSTA",
     "wai_download_connector": "Worker Activity Item Download",
@@ -611,14 +611,15 @@ def write_job_seeker_csv(
     """
     Write the Job Seeker Upload CSV.
 
-    Deduplicates within this run: if the same (worker_id, job_posting_id, shift_date)
-    triple appears more than once, only the first row is written.
+    Deduplicates within this run by (worker_id, job_posting_id): for workers on
+    multi-day shifts (same JP, multiple dates), only the first/earliest row is
+    written so Date Available is always the first day of the engagement.
 
-    Returns a list of "worker_id|job_posting_id|shift_date" keys that were written,
+    Returns a list of "worker_id|job_posting_id" keys that were written,
     for use in the cross-run upload log.
     """
     written_keys: list[str] = []
-    seen_within_run: set[tuple[str, str, str]] = set()
+    seen_within_run: set[tuple[str, str]] = set()
     skipped = 0
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -631,7 +632,7 @@ def write_job_seeker_csv(
             jp         = test_jp or str(row.get("job_posting_id", "")).strip()
             worker_id  = str(row.get("worker_id", "")).strip()
             shift_date = str(row.get("shift_date", "")).strip()
-            key = (worker_id, jp, shift_date)
+            key = (worker_id, jp)
 
             if key in seen_within_run:
                 print(f"  SKIP within-run duplicate: worker {worker_id} / JP {jp} / {shift_date}")
@@ -641,7 +642,7 @@ def write_job_seeker_csv(
             seen_within_run.add(key)
             writer.writerow(build_js_row(row, by_business, by_company, creator, timezone,
                                          test_jp, supplier_code))
-            written_keys.append(f"{worker_id}|{jp}|{shift_date}")
+            written_keys.append(f"{worker_id}|{jp}")
 
     written = len(written_keys)
     suffix = f"  [test-jp={test_jp}]" if test_jp else ""
@@ -1313,17 +1314,17 @@ def main() -> None:
     fg_env = FG_TEST if args.fg_env == "test" else FG_PROD
     supplier_code = fg_env["supplier_code"] if args.fg_upload else "INSTA"
 
-    # Cross-run dedup: skip workers already uploaded for the same JP + date
+    # Cross-run dedup: skip workers already uploaded for the same JP
     already_uploaded = load_upload_log()
     test_jp_val = args.test_jp or ""
     fresh_data = [
         r for r in data
-        if f"{str(r.get('worker_id', '')).strip()}|{test_jp_val or str(r.get('job_posting_id', '')).strip()}|{str(r.get('shift_date', '')).strip()}"
+        if f"{str(r.get('worker_id', '')).strip()}|{test_jp_val or str(r.get('job_posting_id', '')).strip()}"
         not in already_uploaded
     ]
     cross_run_skipped = len(data) - len(fresh_data)
     if cross_run_skipped:
-        print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP/date pair(s) already uploaded.")
+        print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP pair(s) already uploaded.")
 
     js_written_keys = write_job_seeker_csv(
         fresh_data, js_path, by_business, by_company, args.creator, args.timezone,

@@ -161,12 +161,12 @@ def main() -> None:
     test_jp_val = args.test_jp or ""
     fresh_data = [
         r for r in data
-        if f"{str(r.get('worker_id', '')).strip()}|{test_jp_val or str(r.get('job_posting_id', '')).strip()}|{str(r.get('shift_date', '')).strip()}"
+        if f"{str(r.get('worker_id', '')).strip()}|{test_jp_val or str(r.get('job_posting_id', '')).strip()}"
         not in already_uploaded
     ]
     cross_run_skipped = len(data) - len(fresh_data)
     if cross_run_skipped:
-        print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP/date pair(s) already uploaded.")
+        print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP pair(s) already uploaded.")
 
     js_written_keys = write_job_seeker_csv(
         fresh_data, js_path, by_business, by_company, args.creator, args.timezone,
