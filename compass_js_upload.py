@@ -2,7 +2,7 @@
 """
 Compass Job Seeker Upload — scheduled hourly (e.g. 11:00, 12:00, ...).
 
-Pulls enterprise_vmscompass shifts from Redshift from today (or --start) onwards,
+Pulls enterprise_vmscompass shifts from Mode Analytics (CURRENT_DATE onwards),
 writes Job Seeker CSV, uploads to Google Drive, runs a Fieldglass capacity check,
 then submits to Fieldglass and saves the dedup log.
 
@@ -11,10 +11,8 @@ at :30 past each hour, giving Fieldglass time to create work orders first.
 
 Usage:
     python3 compass_js_upload.py
-    python3 compass_js_upload.py --start 2026-03-20 --fg-upload
     python3 compass_js_upload.py --fg-upload --fg-env prod
 
-    --start      Start date YYYY-MM-DD (default: today); query is always open-ended
     --creator    Fieldglass creator username (default: cduong_compass)
     --timezone   Time Zone field in Job Seeker Upload (default: US/Pacific)
     --out        Output folder (default: compass_MMDDYYYY_onwards/ beside this script)
@@ -32,6 +30,7 @@ from pathlib import Path
 from generate_compass_upload import (
     FG_TEST,
     FG_PROD,
+    MODE_REPORT_TOKEN,
     check_jp_capacity,
     fetch_redshift_data,
     fg_get_token,
@@ -54,10 +53,6 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="Compass Job Seeker Upload — runs every hour on the hour."
-    )
-    parser.add_argument(
-        "--start", "-s", default=today,
-        help="Start date YYYY-MM-DD (default: today); query is always open-ended",
     )
     parser.add_argument(
         "--creator", default="cduong_compass",
@@ -93,16 +88,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    start_date  = args.start
-    start_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m%d%Y")
-    date_label  = f"{start_label}_onwards"
+    today_label = datetime.today().strftime("%m%d%Y")
+    date_label  = f"{today_label}_onwards"
     folder_name = f"compass_{date_label}"
 
     out_dir = Path(args.out) if args.out else Path(__file__).parent / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[JS Upload] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Start date:    {start_date} onwards")
+    print(f"Mode report:   {MODE_REPORT_TOKEN} (CURRENT_DATE)")
     print(f"Creator:       {args.creator}")
     print(f"Time Zone:     {args.timezone}")
     print(f"Output folder: {out_dir}")
@@ -114,20 +108,20 @@ def main() -> None:
 
     # 1. Load cost-center lookup from Google Sheets
     try:
-        by_business, by_company = load_cost_center_lookup()
+        by_business = load_cost_center_lookup()
     except Exception as exc:
         print(f"WARNING: Could not load cost-center sheet: {exc}")
         print("         Cost Center Location Code will be blank for all rows.")
-        by_business, by_company = {}, {}
+        by_business = {}
 
-    # 2. Fetch shift data from Redshift
+    # 2. Fetch shift data from Mode
     print()
     try:
-        data = fetch_redshift_data(start_date)
+        data = fetch_redshift_data(today)
     except Exception as exc:
         send_failure_alert(
             _SCRIPT,
-            "Redshift data fetch",
+            "Mode data fetch",
             str(exc),
         )
         return
@@ -135,9 +129,9 @@ def main() -> None:
     if not data:
         send_failure_alert(
             _SCRIPT,
-            "Redshift data fetch",
-            f"No rows returned for start date {start_date} onwards.",
-            "This may indicate a Redshift connectivity issue or no active Compass shifts.",
+            "Mode data fetch",
+            "No rows returned from Mode report.",
+            "This may indicate a Mode API issue or no active Compass shifts today.",
         )
         return
 
@@ -169,7 +163,7 @@ def main() -> None:
         print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP pair(s) already uploaded.")
 
     js_written_keys = write_job_seeker_csv(
-        fresh_data, js_path, by_business, by_company, args.creator, args.timezone,
+        fresh_data, js_path, by_business, args.creator, args.timezone,
         test_jp=test_jp_val, supplier_code=supplier_code,
     )
 

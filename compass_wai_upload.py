@@ -7,14 +7,13 @@ work orders from the Job Seeker submissions. Downloads the Worker Activity Item
 reference, matches workers to their work orders, and uploads the Activity Item
 Completion CSV (onboarding attestation + ServSafe cert dates).
 
+Shift data is sourced from Mode Analytics (CURRENT_DATE onwards).
 The Job Seeker upload runs separately in compass_js_upload.py on the hour.
 
 Usage:
     python3 compass_wai_upload.py
-    python3 compass_wai_upload.py --start 2026-03-20 --fg-upload
     python3 compass_wai_upload.py --fg-upload --fg-env prod
 
-    --start      Start date YYYY-MM-DD (default: today); matches the JS upload run
     --out        Output folder (default: compass_MMDDYYYY_onwards/ beside this script)
     --fg-upload  Upload WAI CSV directly to Fieldglass API
     --fg-env     Fieldglass environment: test (default) or prod
@@ -47,10 +46,6 @@ def main() -> None:
         description="Compass WAI Upload — runs every hour at :30 past the hour."
     )
     parser.add_argument(
-        "--start", "-s", default=today,
-        help="Start date YYYY-MM-DD (default: today); should match the JS upload run",
-    )
-    parser.add_argument(
         "--out", "-o",
         help="Output folder (default: compass_MMDDYYYY_onwards/ beside this script)",
     )
@@ -68,16 +63,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    start_date  = args.start
-    start_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m%d%Y")
-    date_label  = f"{start_label}_onwards"
+    today_label = datetime.today().strftime("%m%d%Y")
+    date_label  = f"{today_label}_onwards"
     folder_name = f"compass_{date_label}"
 
     out_dir = Path(args.out) if args.out else Path(__file__).parent / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[WAI Upload] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Start date:    {start_date} onwards")
+    print(f"Mode report:   CURRENT_DATE")
     print(f"Output folder: {out_dir}")
     if args.fg_upload:
         print(f"FG upload:     {args.fg_env} environment")
@@ -85,20 +79,20 @@ def main() -> None:
         print(f"Test JP override: {args.test_jp}")
     print()
 
-    # 1. Fetch shift data from Redshift (needed for completion date fields:
+    # 1. Fetch shift data from Mode (needed for completion date fields:
     #    onboarding date, ServSafe/alcohol cert dates, BGC pass date)
     try:
-        data = fetch_redshift_data(start_date)
+        data = fetch_redshift_data(today)
     except Exception as exc:
         send_failure_alert(
             _SCRIPT,
-            "Redshift data fetch",
+            "Mode data fetch",
             str(exc),
         )
         return
 
     if not data:
-        print(f"No rows returned from Redshift for {start_date} onwards. Exiting.")
+        print("No rows returned from Mode report. Exiting.")
         return
 
     # If a test JP override is set, patch each row so the WAI lookup key matches

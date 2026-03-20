@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Generate VMS Compass Fieldglass Job Seeker Upload CSVs from Redshift.
+Generate VMS Compass Fieldglass Job Seeker Upload CSVs from Mode Analytics.
 
-Queries all enterprise_vmscompass companies from today (or a specified start
-date) onwards with no upper bound, then produces two output files:
+Triggers a Mode report (report token c34f7095968e) that queries all
+enterprise_vmscompass companies from today onwards, then produces two output files:
   1. {label}_input.csv             — raw data (mirrors the Input report format)
   2. {label}_job_seeker_upload.csv — Fieldglass Job Seeker Upload format
 
@@ -12,11 +12,9 @@ the Sheets API using the existing service account credentials.json.
 
 Usage:
     python generate_compass_upload.py
-    python generate_compass_upload.py --start 2026-03-07
-    python generate_compass_upload.py --start 2026-03-07 --fg-upload
-    python generate_compass_upload.py --start 2026-03-07 --fg-env prod
+    python generate_compass_upload.py --fg-upload
+    python generate_compass_upload.py --fg-upload --fg-env prod
 
-    --start     Start date YYYY-MM-DD (default: today); query is always open-ended
     --creator   Fieldglass creator username (default: cduong_compass)
     --timezone  Time Zone field in Job Seeker Upload (default: US/Pacific)
     --out       Output folder (default: compass_MMDDYYYY_onwards/ beside this script)
@@ -28,9 +26,9 @@ Usage:
     --no-email   Print capacity alert drafts only, do not send emails
 
 Required environment variables (or set defaults below):
-    REDSHIFT_CLUSTER_ID   e.g. instawork-dw
-    REDSHIFT_DB           e.g. instawork
-    REDSHIFT_DB_USER      e.g. cursor_analytics
+    MODE_API_KEY_ID       Mode API token ID
+    MODE_API_SECRET       Mode API token secret
+    MODE_REPORT_TOKEN     Mode report token (default: c34f7095968e)
     GOOGLE_APPLICATION_CREDENTIALS  path to credentials.json
     SHEETS_ID             Google Sheet ID for cost-center lookup
 """
@@ -46,18 +44,18 @@ from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import boto3
 import requests
-from botocore.exceptions import ClientError
+from requests.auth import HTTPBasicAuth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ── Redshift config ────────────────────────────────────────────────────────────
-REDSHIFT_CLUSTER_ID = os.getenv("REDSHIFT_CLUSTER_ID", "instawork-dw")
-REDSHIFT_DB         = os.getenv("REDSHIFT_DB",         "instawork")
-REDSHIFT_DB_USER    = os.getenv("REDSHIFT_DB_USER",    "cursor_analytics")
-REDSHIFT_REGION     = os.getenv("REDSHIFT_REGION",     "us-west-2")
+# ── Mode Analytics config ──────────────────────────────────────────────────────
+MODE_API_KEY_ID     = os.getenv("MODE_API_KEY_ID",     "913ae899b38a")
+MODE_API_SECRET     = os.getenv("MODE_API_SECRET",     "5267e2734ba930c46c4fd651")
+MODE_WORKSPACE      = os.getenv("MODE_WORKSPACE",      "instawork")
+MODE_REPORT_TOKEN   = os.getenv("MODE_REPORT_TOKEN",   "c34f7095968e")
+MODE_BASE_URL       = "https://app.mode.com/api"
 
 # ── Google config ──────────────────────────────────────────────────────────────
 GOOGLE_CREDENTIALS_PATH = os.getenv(
@@ -69,10 +67,10 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Cost-center lookup sheet: https://docs.google.com/spreadsheets/d/1dhG37...
-SHEETS_ID    = os.getenv("SHEETS_ID", "1dhG37kBG0-fAeUuKvIb7uhwit_zqZ2XZDCVYS1FeZqA")
-# gid=1631736750 → convert to sheet name at runtime via Sheets API metadata
-SHEETS_GID   = os.getenv("SHEETS_GID", "1631736750")
+# Cost-center lookup sheet: https://docs.google.com/spreadsheets/d/1TNd4Fj7Bnu5o3lZ6ESZzlRPpV5RKRR1CbMEtUl-tfpc/edit?gid=1374512336
+SHEETS_ID    = os.getenv("SHEETS_ID", "1TNd4Fj7Bnu5o3lZ6ESZzlRPpV5RKRR1CbMEtUl-tfpc")
+# gid=1374512336 → convert to sheet name at runtime via Sheets API metadata
+SHEETS_GID   = os.getenv("SHEETS_GID", "1374512336")
 
 # Google Drive folder to upload output into
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "0ALWkbq6tvGD7Uk9PVA")
@@ -100,7 +98,7 @@ FG_TEST = {
 FG_PROD = {
     "base_url":              "https://www.us.fieldglass.cloud.sap",
     "app_key":               os.getenv("FG_PROD_APP_KEY",     "dlgEbqGNj4Eg45JA5ll9AMWbhSa"),
-    "iu_user":               os.getenv("FG_PROD_IU_USER",     "Christine"),
+    "iu_user":               os.getenv("FG_PROD_IU_USER",     "cduong_compass"),
     "iu_password":           os.getenv("FG_PROD_IU_PASSWORD", "INSTA_jBMTeGaKPZarS6fLkBJgnbcDCU2"),
     "connector":             "Job Seeker Upload",
     "supplier_code":         "INSTA",
@@ -157,273 +155,64 @@ JS_COLUMNS = [
     "Errors Found In Upload",
 ]
 
-# ── SQL ────────────────────────────────────────────────────────────────────────
-
-def build_sql(start_date: str, end_date: str | None = None) -> str:
-    """Return the full Redshift SQL for the given date range (YYYY-MM-DD).
-
-    If end_date is None, queries all shifts on or after start_date (open-ended).
-    """
-    if end_date:
-        date_filter = f"BETWEEN '{start_date}' AND '{end_date}'"
-    else:
-        date_filter = f">= '{start_date}'"
-    return f"""
-WITH shift_data AS (
-    SELECT
-        bc.id   AS company_id,
-        bc.name AS company_name,
-        b.id    AS business_id,
-        b.name  AS business_name,
-        bs.id   AS shift_id,
-        gt.name AS shift_name,
-        pp.name AS position,
-        bs.worker_id,
-        bs.applicant_rate_usd AS pro_rate,
-        bs.business_rate_usd  AS business_rate,
-        convert_timezone(COALESCE(p.timezone, 'America/Chicago'), sg.starts_at) AS shift_starts_at,
-        convert_timezone(COALESCE(p.timezone, 'America/Chicago'), sg.ends_at)   AS shift_ends_at,
-        bs.external_id AS job_posting_id
-    FROM iw_backend_db.backend_shift bs
-    JOIN iw_backend_db.backend_shiftgroup sg    ON sg.id = bs.shift_group_id
-    JOIN iw_backend_db.backend_gigtemplate gt   ON gt.id = sg.gig_id
-    JOIN iw_backend_db.business b               ON b.id  = gt.business_id
-    LEFT JOIN iw_backend_db.places_place p      ON p.id  = b.place_id
-    JOIN iw_backend_db.backend_company bc       ON bc.id = b.company_id
-    LEFT JOIN iw_backend_db.positions_position pp ON pp.id = gt.position_fk_id
-    WHERE bc.id IN (
-        -- enterprise_vmscompass tagged companies (fetched 2026-03-11)
-        53736, 58644, 109828, 77311, 109769, 88880, 33415, 92310,
-        54508, 18257, 109288, 110207, 37075, 32400, 58005, 108885,
-        58261, 33257
-    )
-      AND DATE(DATE_TRUNC('day', convert_timezone(COALESCE(p.timezone, 'America/Chicago'), sg.starts_at)))
-              {date_filter}
-      AND bs.worker_id   IS NOT NULL
-      AND bs.is_cancelled = 0
-      AND bs.business_rate_usd  > 0
-      AND bs.applicant_rate_usd > 0
-),
-
-persona_names AS (
-    SELECT
-        dvl.user_id,
-        dvl.first_name AS persona_first_name,
-        dvl.last_name  AS persona_last_name,
-        ROW_NUMBER() OVER (PARTITION BY dvl.user_id ORDER BY dvl.created_at DESC) AS rn
-    FROM iw_backend_db.identity_verification_documentverificationlog dvl
-    WHERE dvl.is_valid_name = true
-      AND dvl.user_id IN (SELECT DISTINCT worker_id FROM shift_data)
-),
-
-worker_resolved AS (
-    SELECT
-        sd.*,
-        INITCAP(COALESCE(pn.persona_first_name, up.given_name,
-            CASE WHEN up.name IS NOT NULL AND REGEXP_COUNT(up.name, ' ') >= 1
-                 THEN SPLIT_PART(up.name, ' ', 1) END
-        )) AS first_name,
-        INITCAP(COALESCE(pn.persona_last_name, up.family_name,
-            CASE WHEN up.name IS NOT NULL AND REGEXP_COUNT(up.name, ' ') >= 1
-                 THEN SPLIT_PART(up.name, ' ', 2) END
-        )) AS last_name,
-        CASE
-            WHEN pn.persona_first_name IS NOT NULL THEN 'Persona'
-            ELSE 'Self-reported'
-        END AS name_source,
-        up.email AS worker_email,
-        redshift_decrypt(up.dob)::date AS worker_dob,
-        up.background_check_status
-    FROM shift_data sd
-    JOIN iw_backend_db.backend_userprofile up ON up.id = sd.worker_id
-    LEFT JOIN persona_names pn ON pn.user_id = sd.worker_id AND pn.rn = 1
-),
-
--- TAM / Alcohol Card (Las Vegas) — certificate type ID 17
-alcohol_certs AS (
-    SELECT
-        wc.worker_id,
-        wc.expires_at AS alcohol_cert_expires_at,
-        ROW_NUMBER() OVER (PARTITION BY wc.worker_id ORDER BY wc.expires_at DESC NULLS LAST) AS rn
-    FROM iw_backend_db.backend_workercertificate wc
-    JOIN iw_backend_db.backend_certificatetype ct ON ct.id = wc.certificate_type_id
-    WHERE ct.id = 17
-      AND wc.worker_id IN (SELECT DISTINCT worker_id FROM shift_data)
-),
-
--- CA RBS — certificate type ID 8
-food_handler_certs AS (
-    SELECT
-        wc.worker_id,
-        wc.expires_at AS food_handler_cert_expires_at,
-        ROW_NUMBER() OVER (PARTITION BY wc.worker_id ORDER BY wc.expires_at DESC NULLS LAST) AS rn
-    FROM iw_backend_db.backend_workercertificate wc
-    JOIN iw_backend_db.backend_certificatetype ct ON ct.id = wc.certificate_type_id
-    WHERE ct.id = 8
-      AND wc.worker_id IN (SELECT DISTINCT worker_id FROM shift_data)
-),
-
--- AZ Title 4 — certificate type ID 6
-az_title4_certs AS (
-    SELECT
-        wc.worker_id,
-        wc.expires_at AS az_title4_cert_expires_at,
-        ROW_NUMBER() OVER (PARTITION BY wc.worker_id ORDER BY wc.expires_at DESC NULLS LAST) AS rn
-    FROM iw_backend_db.backend_workercertificate wc
-    JOIN iw_backend_db.backend_certificatetype ct ON ct.id = wc.certificate_type_id
-    WHERE ct.id = 6
-      AND wc.worker_id IN (SELECT DISTINCT worker_id FROM shift_data)
-),
-
-bgc_requests AS (
-    SELECT
-        bgc_c.user_id AS worker_id,
-        bgc_r.status  AS bgc_request_status,
-        bgc_r.updated_at AS bgc_request_updated_at,
-        ROW_NUMBER() OVER (PARTITION BY bgc_c.user_id ORDER BY bgc_r.id DESC) AS rn
-    FROM iw_backend_db.w2_backgroundcheckcheckrcandidate bgc_c
-    JOIN iw_backend_db.w2_backgroundcheckrequestcheckr bgc_r
-        ON bgc_r.candidate_id = bgc_c.id
-    JOIN iw_backend_db.w2_backgroundcheckcheckrpackage bgc_p
-        ON bgc_p.id = bgc_r.package_id AND bgc_p.check_type = 'criminal'
-    WHERE bgc_c.user_id IN (SELECT DISTINCT worker_id FROM shift_data)
-),
-
-bgc_pass_dates AS (
-    SELECT
-        bgc_pass.user_id AS worker_id,
-        COALESCE(
-            bgc_pass.passed_standard_background_check_at,
-            bgc_pass.passed_enhanced_background_check_at
-        ) AS bg_check_pass_date,
-        ROW_NUMBER() OVER (PARTITION BY bgc_pass.user_id ORDER BY bgc_pass.id DESC) AS rn
-    FROM iw_backend_db.w2_backgroundcheckcheckrcandidate bgc_pass
-    WHERE bgc_pass.user_id IN (SELECT DISTINCT worker_id FROM shift_data)
-)
-
-SELECT
-    w.company_id,
-    w.company_name,
-    w.business_id,
-    w.business_name,
-    w.shift_id,
-    w.shift_name,
-    w.position,
-    TO_CHAR(w.shift_starts_at, 'MM/DD/YYYY') AS shift_date,
-    TO_CHAR(w.shift_starts_at, 'HH24:MI')    AS start_time,
-    TO_CHAR(w.shift_ends_at,   'HH24:MI')    AS end_time,
-    w.pro_rate,
-    w.business_rate,
-
-    w.worker_id,
-    w.first_name,
-    w.last_name,
-    w.name_source,
-    w.worker_email,
-
-    TO_CHAR(w.worker_dob, 'MM/DD/YYYY') AS worker_dob,
-
-    LOWER(
-        RPAD(LEFT(REGEXP_REPLACE(COALESCE(w.first_name, ''), '[^A-Za-z]', ''), 4), 4, 'x')
-        || RPAD(LEFT(REGEXP_REPLACE(COALESCE(w.last_name,  ''), '[^A-Za-z]', ''), 4), 4, 'x')
-        || COALESCE(TO_CHAR(w.worker_dob, 'MMDD'), 'xxxx')
-    ) AS security_id,
-
-    TO_CHAR(ac.alcohol_cert_expires_at,      'MM/DD/YYYY') AS tam_alcohol_cert_expires_at,
-    TO_CHAR(fh.food_handler_cert_expires_at, 'MM/DD/YYYY') AS ca_rbs_cert_expires_at,
-    TO_CHAR(az.az_title4_cert_expires_at,    'MM/DD/YYYY') AS az_title4_cert_expires_at,
-
-    CASE w.background_check_status
-        WHEN 0 THEN 'Not Started'
-        WHEN 1 THEN 'Started'
-        WHEN 2 THEN 'Passed'
-        WHEN 3 THEN 'Failed'
-        WHEN 4 THEN 'In Review'
-        WHEN 5 THEN 'Pre-Adverse Action Notice'
-        WHEN 6 THEN 'Suspended'
-        WHEN 7 THEN 'Hold'
-        ELSE 'Unknown'
-    END AS background_check_status,
-    bgc.bgc_request_status,
-    TO_CHAR(bp.bg_check_pass_date, 'MM/DD/YYYY') AS bg_check_pass_date,
-
-    w.job_posting_id
-
-FROM worker_resolved w
-LEFT JOIN alcohol_certs    ac  ON ac.worker_id  = w.worker_id AND ac.rn  = 1
-LEFT JOIN food_handler_certs fh ON fh.worker_id = w.worker_id AND fh.rn  = 1
-LEFT JOIN az_title4_certs  az  ON az.worker_id  = w.worker_id AND az.rn  = 1
-LEFT JOIN bgc_requests     bgc ON bgc.worker_id = w.worker_id AND bgc.rn = 1
-LEFT JOIN bgc_pass_dates   bp  ON bp.worker_id  = w.worker_id AND bp.rn  = 1
-ORDER BY w.shift_starts_at, w.business_name, w.last_name
-"""
-
-
-# ── Redshift Data API helpers ──────────────────────────────────────────────────
-
-def _redshift_client():
-    return boto3.client("redshift-data", region_name=REDSHIFT_REGION)
-
+# ── Mode Analytics data fetch ──────────────────────────────────────────────────
 
 def fetch_redshift_data(start_date: str, end_date: str | None = None) -> list[dict]:
-    """Execute SQL against Redshift and return all rows as a list of dicts."""
-    client = _redshift_client()
-    sql = build_sql(start_date, end_date)
+    """Trigger a Mode report run and return all rows as a list of dicts.
 
-    range_desc = f"{start_date} → {end_date}" if end_date else f"{start_date} onwards"
-    print(f"Submitting query to Redshift ({REDSHIFT_CLUSTER_ID}/{REDSHIFT_DB}) for {range_desc}...")
-    kwargs: dict = dict(
-        ClusterIdentifier=REDSHIFT_CLUSTER_ID,
-        Database=REDSHIFT_DB,
-        Sql=sql,
+    start_date and end_date are accepted for API compatibility but ignored —
+    the Mode report (c34f7095968e) uses CURRENT_DATE in its SQL.
+    """
+    auth = HTTPBasicAuth(MODE_API_KEY_ID, MODE_API_SECRET)
+    base = f"{MODE_BASE_URL}/{MODE_WORKSPACE}"
+
+    print(f"Triggering Mode report {MODE_REPORT_TOKEN}...")
+    run_resp = requests.post(
+        f"{base}/reports/{MODE_REPORT_TOKEN}/runs",
+        auth=auth,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json={"parameters": {}},
+        timeout=30,
     )
-    if REDSHIFT_DB_USER:
-        kwargs["DbUser"] = REDSHIFT_DB_USER
-
-    try:
-        resp = client.execute_statement(**kwargs)
-    except ClientError as exc:
-        raise RuntimeError(f"Redshift execute_statement failed: {exc}") from exc
-
-    statement_id = resp["Id"]
-    print(f"Statement ID: {statement_id} — waiting for completion...")
-
-    for attempt in range(120):
-        time.sleep(5)
-        status_resp = client.describe_statement(Id=statement_id)
-        state = status_resp["Status"]
-        print(f"  [{attempt + 1}] state: {state}")
-        if state == "FINISHED":
-            break
-        if state in ("FAILED", "ABORTED"):
-            raise RuntimeError(
-                f"Redshift query {state}: {status_resp.get('Error', 'unknown error')}"
-            )
-    else:
-        raise RuntimeError("Timed out waiting for Redshift query to complete.")
-
-    rows_meta = client.get_statement_result(Id=statement_id)
-    column_names = [col["name"] for col in rows_meta["ColumnMetadata"]]
-    all_records = rows_meta["Records"]
-
-    # Paginate if needed
-    while "NextToken" in rows_meta:
-        rows_meta = client.get_statement_result(
-            Id=statement_id, NextToken=rows_meta["NextToken"]
+    if run_resp.status_code != 202:
+        raise RuntimeError(
+            f"Mode report run failed (HTTP {run_resp.status_code}): {run_resp.text[:300]}"
         )
-        all_records.extend(rows_meta["Records"])
 
-    def _value(field: dict):
-        for key in ("stringValue", "longValue", "doubleValue", "booleanValue"):
-            if key in field:
-                return field[key]
-        return ""  # isNull
+    run_token = run_resp.json()["token"]
+    print(f"  Run token: {run_token} — waiting for completion...")
 
-    rows = [
-        {col: _value(field) for col, field in zip(column_names, record)}
-        for record in all_records
-    ]
-    print(f"Fetched {len(rows)} rows from Redshift.")
+    for attempt in range(60):
+        time.sleep(5)
+        status_resp = requests.get(
+            f"{base}/reports/{MODE_REPORT_TOKEN}/runs/{run_token}",
+            auth=auth,
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        status_resp.raise_for_status()
+        state = status_resp.json().get("state", "")
+        print(f"  [{attempt + 1}] state: {state}")
+        if state == "succeeded":
+            break
+        if state in ("failed", "cancelled"):
+            raise RuntimeError(f"Mode report run {state}: {status_resp.text[:300]}")
+    else:
+        raise RuntimeError("Timed out waiting for Mode report to complete.")
+
+    print("  Downloading CSV results...")
+    csv_resp = requests.get(
+        f"{base}/reports/{MODE_REPORT_TOKEN}/runs/{run_token}/results/content.csv",
+        auth=auth,
+        timeout=120,
+    )
+    if csv_resp.status_code != 200:
+        raise RuntimeError(
+            f"Mode CSV download failed (HTTP {csv_resp.status_code}): {csv_resp.text[:300]}"
+        )
+
+    rows = list(csv.DictReader(io.StringIO(csv_resp.text)))
+    print(f"Fetched {len(rows)} rows from Mode.")
     return rows
 
 
@@ -446,20 +235,17 @@ def _gid_to_sheet_name(service, spreadsheet_id: str, gid: str) -> str:
     raise ValueError(f"Sheet with gid={gid} not found in spreadsheet {spreadsheet_id}")
 
 
-def load_cost_center_lookup() -> tuple[dict[str, str], dict[str, str]]:
+def load_cost_center_lookup() -> dict[str, str]:
     """
-    Read the IW Mapping Google Sheet and return two lookup dicts (hardcoded column indices):
-        by_business_id : IW Business ID (col 12) -> Cost Center Location Code (col 3)
-        by_company_id  : IW Company ID  (col 10) -> Cost Center Location Code (col 3)
+    Read the cost-center Google Sheet and return a lookup dict keyed by business_id.
 
     Sheet columns (0-indexed):
-        3  = Cost Center Location Code
-        10 = IW Company ID
-        12 = IW Business ID
+        0 = cost_center_code
+        1 = cost_center_name
+        2 = business_id
     """
-    COL_COST_CENTER = 3
-    COL_COMPANY_ID  = 10
-    COL_BUSINESS_ID = 12
+    COL_COST_CENTER = 0
+    COL_BUSINESS_ID = 2
 
     svc = _sheets_service()
     sheet_name = _gid_to_sheet_name(svc, SHEETS_ID, SHEETS_GID)
@@ -475,10 +261,9 @@ def load_cost_center_lookup() -> tuple[dict[str, str], dict[str, str]]:
     values = result.get("values", [])
     if not values:
         print("WARNING: Cost-center sheet returned no data.")
-        return {}, {}
+        return {}
 
     by_business: dict[str, str] = {}
-    by_company:  dict[str, str] = {}
 
     for i, row in enumerate(values):
         if i == 0:
@@ -494,26 +279,8 @@ def load_cost_center_lookup() -> tuple[dict[str, str], dict[str, str]]:
             if biz_id:
                 by_business[biz_id] = code
 
-        if len(row) > COL_COMPANY_ID:
-            co_id = str(row[COL_COMPANY_ID]).strip()
-            if co_id:
-                by_company.setdefault(co_id, code)  # first match wins
-
-    # Hardcoded overrides for VMS Flexforce businesses whose IW Business ID
-    # is not yet set correctly in the Google Sheet.
-    # Format: "IW business_id" -> "Cost Center Location Code"
-    VMS_OVERRIDES = {
-        "314301": "34073",   # UC MGMT       (United Center)
-        "314802": "65515",   # UWW DrumlinReshall
-        "314314": "50990",   # FCCIN MGMT    (FC Cincinnati)
-        "314216": "36884",   # PIRW ADMIN    (Phoenix Raceway)
-        "314991": "33831",   # TMS ADMIN     (Texas Motor Speedway)
-    }
-    by_business.update(VMS_OVERRIDES)
-
-    print(f"Loaded {len(by_business)} business-level and {len(by_company)} company-level cost-center mappings "
-          f"(includes {len(VMS_OVERRIDES)} hardcoded VMS overrides).")
-    return by_business, by_company
+    print(f"Loaded {len(by_business)} business-level cost-center mappings.")
+    return by_business
 
 
 # ── CSV writers ────────────────────────────────────────────────────────────────
@@ -542,7 +309,6 @@ def write_input_csv(rows: list[dict], path: Path) -> None:
 def build_js_row(
     row: dict,
     by_business: dict[str, str],
-    by_company: dict[str, str],
     creator: str,
     timezone: str,
     test_jp: str = "",
@@ -550,11 +316,8 @@ def build_js_row(
 ) -> list:
     """Map one input row to a Job Seeker Upload data row (33 columns)."""
     business_id = str(row.get("business_id", "")).strip()
-    company_id  = str(row.get("company_id",  "")).strip()
 
     cost_center = by_business.get(business_id, "")
-    if not cost_center:
-        cost_center = by_company.get(company_id, "")
     if not cost_center:
         print(f"  WARNING: No cost-center code for business_id={business_id} "
               f"({row.get('business_name', '')})")
@@ -602,7 +365,6 @@ def write_job_seeker_csv(
     rows: list[dict],
     path: Path,
     by_business: dict[str, str],
-    by_company: dict[str, str],
     creator: str,
     timezone: str,
     test_jp: str = "",
@@ -640,7 +402,7 @@ def write_job_seeker_csv(
                 continue
 
             seen_within_run.add(key)
-            writer.writerow(build_js_row(row, by_business, by_company, creator, timezone,
+            writer.writerow(build_js_row(row, by_business, creator, timezone,
                                          test_jp, supplier_code))
             written_keys.append(f"{worker_id}|{jp}")
 
@@ -745,15 +507,48 @@ def fg_upload_job_seeker_csv(csv_path: Path, env: dict) -> list[str]:
             for blk in record_blocks
             if not ("of" in blk and "record" in blk.lower())
         ]
+
+        # Build record-number → Job Posting ID map from the uploaded CSV.
+        # JS CSV layout: 9 JS_HEADER_LINES rows + 1 JS_COLUMNS header row = 10 rows
+        # to skip; data rows follow 1-indexed from Fieldglass's perspective.
+        # JS_COLUMNS index 3 = "Job Posting ID"
+        JP_COL_IDX  = 3
+        SKIP_ROWS   = len(JS_HEADER_LINES) + 1  # 9 fixed header rows + column header
+        jp_by_record: dict[int, str] = {}
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as _f:
+                reader = csv.reader(_f)
+                for _i, _row in enumerate(reader):
+                    if _i < SKIP_ROWS:
+                        continue
+                    record_num = _i - SKIP_ROWS + 1  # 1-based
+                    jp_id = _row[JP_COL_IDX].strip() if len(_row) > JP_COL_IDX else ""
+                    if jp_id:
+                        jp_by_record[record_num] = jp_id
+        except Exception:
+            pass  # annotation is best-effort; don't block error reporting
+
+        # Annotate each error string with the JP ID if available
+        annotated_errors = []
+        import re as _re
+        for err in errors:
+            m = _re.match(r"Record\s+(\d+)", err)
+            if m:
+                rec_num = int(m.group(1))
+                jp_id   = jp_by_record.get(rec_num, "")
+                if jp_id:
+                    err = err.replace(f"Record {rec_num}", f"Record {rec_num} [JP={jp_id}]", 1)
+            annotated_errors.append(err)
+
         print(f"  Fieldglass upload PARTIAL  TransactionID={txn}")
         print(f"  Summary: {summary or 'see errors below'}")
-        if errors:
-            print(f"  Row errors ({len(errors)}):")
-            for err_line in errors[:20]:
+        if annotated_errors:
+            print(f"  Row errors ({len(annotated_errors)}):")
+            for err_line in annotated_errors[:20]:
                 print(f"    {err_line.strip()}")
-            if len(errors) > 20:
-                print(f"    ... and {len(errors) - 20} more.")
-        return errors
+            if len(annotated_errors) > 20:
+                print(f"    ... and {len(annotated_errors) - 20} more.")
+        return annotated_errors
     else:
         raise RuntimeError(
             f"Fieldglass upload FAILED (HTTP {resp.status_code}, RC={rc}): {msg}"
@@ -1217,10 +1012,6 @@ def main() -> None:
         description="Generate VMS Compass Fieldglass Job Seeker Upload CSVs."
     )
     parser.add_argument(
-        "--start", "-s", default=today,
-        help="Start date YYYY-MM-DD (default: today); query is always open-ended",
-    )
-    parser.add_argument(
         "--creator", default="cduong_compass",
         help="Fieldglass Creator Username (default: cduong_compass)",
     )
@@ -1262,15 +1053,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    start_date  = args.start
-    start_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m%d%Y")
-    date_label  = f"{start_label}_onwards"
+    today_label = datetime.today().strftime("%m%d%Y")
+    date_label  = f"{today_label}_onwards"
     folder_name = f"compass_{date_label}"
 
     out_dir = Path(args.out) if args.out else Path(__file__).parent / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Start date:    {start_date} onwards")
+    print(f"Mode report:   {MODE_REPORT_TOKEN} (CURRENT_DATE)")
     print(f"Creator:       {args.creator}")
     print(f"Time Zone:     {args.timezone}")
     print(f"Output folder: {out_dir}")
@@ -1284,18 +1074,18 @@ def main() -> None:
 
     # 1. Load cost-center lookup from Google Sheets
     try:
-        by_business, by_company = load_cost_center_lookup()
+        by_business = load_cost_center_lookup()
     except Exception as exc:
         print(f"WARNING: Could not load cost-center sheet: {exc}")
         print("         Cost Center Location Code will be blank for all rows.")
-        by_business, by_company = {}, {}
+        by_business = {}
 
-    # 2. Fetch shift data from Redshift
+    # 2. Fetch shift data from Mode
     print()
-    data = fetch_redshift_data(start_date)
+    data = fetch_redshift_data(today)
 
     if not data:
-        print(f"No rows returned from Redshift for {start_date} onwards. Exiting.")
+        print("No rows returned from Mode report. Exiting.")
         return
 
     # Sort by shift date, business name, last name (already ordered by SQL, but ensure)
@@ -1327,7 +1117,7 @@ def main() -> None:
         print(f"  Cross-run dedup: skipped {cross_run_skipped} worker/JP pair(s) already uploaded.")
 
     js_written_keys = write_job_seeker_csv(
-        fresh_data, js_path, by_business, by_company, args.creator, args.timezone,
+        fresh_data, js_path, by_business, args.creator, args.timezone,
         test_jp=test_jp_val, supplier_code=supplier_code,
     )
 
